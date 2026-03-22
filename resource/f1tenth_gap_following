@@ -1,16 +1,15 @@
 import rclpy
 from rclpy.node import Node
-
 import numpy as np
 import math
+from datetime import datetime
 from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped, AckermannDrive
 
 
 class ReactiveFollowGap(Node):
     """
-    Implement Wall Following on the car
-    This is just a template, you are free to implement your own node!
+    Implement Gap Following on the car
     """
 
     def __init__(self):
@@ -18,17 +17,6 @@ class ReactiveFollowGap(Node):
         # Topics & Subs, Pubs
         lidarscan_topic = "/scan"
         drive_topic = "/drive"
-
-        self.angle_window = 5  # number of samples for mean filtering
-        # self.max_range = 3.0    # maximum range to consider (meters)
-        self.radius = (
-            0.15  # radius of the bubble around closest point to clear (meters)
-        )
-        self.safety_distance = 0.25  # safety distance threshold
-
-        # Steering smoothing
-        self.prev_steering = 0.0
-        self.steering_smoothing = 0.8
 
         # Create ROS subscriber and publisher
         self.scan_subscriber = self.create_subscription(
@@ -38,8 +26,26 @@ class ReactiveFollowGap(Node):
             AckermannDriveStamped, "/drive", 10
         )
 
+        self.max_range = 3.0  # Only care about obstacles within max_range (m)
+        self.kernel_size = 5  # number of samples for mean filtering
+        self.radius = 0.35  # radius of the bubble (m)
+        self.speed_factor = 1.2  # Factor for controlling the speed for debugging
+        # Specify the interested range of lidar data in degrees
+        self.crop_angle_left = 90
+        self.crop_angle_right = -90
+
+        self.look_ahead_dist = 1.5  # look ahead distance for detecting a deadend (m)
+        self.safety_distance = 0.65  # safety distance threshold (m)
+
+        # Steering smoothing
+        self.prev_steering = 0.0
+        self.steering_smoothing = 0.75
+
+    def angle_to_index(self, angle):
+        return int((math.radians(angle) - self.angle_min) // self.angle_increment)
+
     def preprocess_lidar(self, ranges):
-        """Preprocess the LiDAR scan array. Expert implementation includes:
+        """Preprocess the LiDAR scan array.
         1.Setting each value to the mean over some window (Window size is set to 5)
         2.Rejecting high values (eg. > 3m)
         """
@@ -47,36 +53,29 @@ class ReactiveFollowGap(Node):
         # Convert to numpy array if it's not already
         ranges = np.array(ranges)
 
-        # Perform slicing to get the lidar data from right 90˚ angle (180) to the left 90˚ angle (900)
-        # proc_ranges = ranges.copy()
-
-        # -90˚ ~ 90˚
-        proc_ranges = ranges[179:902]
-
-        # -65˚ ~ 65˚
-        # proc_ranges = ranges[280:801]
-
-        # -45˚ ~ 45˚
-        # proc_ranges = ranges[360:720]
-
-        # -30˚ ~ 30˚
-        # proc_ranges = ranges[420:660]
+        # Perform slicing to get the lidar data from crop_angle_min to crop_angle_max
+        # E.g, crop_angle_min = -90˚, crop_angle_max = 90˚, proc_ranges is the lidar data in this range
+        proc_ranges = ranges[
+            self.angle_to_index(self.crop_angle_right) : self.angle_to_index(
+                self.crop_angle_left
+            )
+        ]
 
         # Replace infinite, NaN, and non-positive values with max_range
-        max_range = 3.0
         proc_ranges = np.where(
-            (~np.isfinite(proc_ranges)) | (proc_ranges <= 0.0), max_range, proc_ranges
+            (~np.isfinite(proc_ranges)) | (proc_ranges <= 0.0),
+            self.max_range,
+            proc_ranges,
         )
 
         # Apply mean filtering over a window
-        kernel_size = self.angle_window
-        if kernel_size > 0:
+        if self.kernel_size > 0:
             # Use convolution for mean filtering
-            kernel = np.ones(kernel_size) / kernel_size
+            kernel = np.ones(self.kernel_size) / self.kernel_size
             proc_ranges = np.convolve(proc_ranges, kernel, mode="same")
 
         # Reject high values (set to max_range of 3.0 meters)
-        proc_ranges = np.clip(proc_ranges, 0, 3.0)
+        proc_ranges = np.clip(proc_ranges, 0, self.max_range)
 
         return proc_ranges
 
@@ -137,49 +136,53 @@ class ReactiveFollowGap(Node):
             # Obtain the distance from the n-th nearest point and the point next to it
             D_t = ranges[min_index]
 
-            # Check bounds before accessing neighbors
-            if min_index + n >= len(ranges):
-                left_exceed = True
-            else:
-                D_n_left = ranges[min_index + n]
-
-                # Angle between the two beams (radians)
-                theta = math.radians(0.25 * n)
-
-                # Draw a perpendicular line from the n-th nearest point to the neighbor beam
-                # Use trigonometry to calculate the distance from the n-th neighbor point to the nearest point
-                s1 = math.sin(theta) * D_t
-
-                s2_left = D_n_left - math.cos(theta) * D_t
-                D_t2n_left = math.sqrt(s1**2 + s2_left**2)
-
-                # Check if the distance from then-th neighbor point to the nearest point is within the radius of the bubble
-                if D_t2n_left < self.radius:
-                    # If it is, set the value of the neighbor point to 0 (eliminate it)
-                    ranges[min_index + n] = 0.0
-                else:
+            if not left_exceed:
+                # Check bounds before accessing neighbors
+                if min_index + n >= len(ranges):
                     left_exceed = True
-
-            if min_index - n < 0:
-                right_exceed = True
-            else:
-                D_n_right = ranges[min_index - n]
-
-                # Angle between the two beams (radians)
-                theta = math.radians(0.25 * n)
-
-                # Draw a perpendicular line from the n-th nearest point to the neighbor beam
-                # Use trigonometry to calculate the distance from the n-th neighbor point to the nearest point
-                s1 = math.sin(theta) * D_t
-
-                s2_right = D_n_right - math.cos(theta) * D_t
-                D_t2n_right = math.sqrt(s1**2 + s2_right**2)
-
-                if D_t2n_right < self.radius:
-                    # If it is, set the value of the neighbor point to 0 (eliminate it)
-                    ranges[min_index - n] = 0.0
                 else:
+                    D_n_left = ranges[min_index + n]
+
+                    # Angle between the two beams (radians)
+                    theta = math.radians(math.radians(self.angle_increment) * n)
+                    # theta = math.radians(0.25 * n)
+
+                    # Draw a perpendicular line from the n-th nearest point to the neighbor beam
+                    # Use trigonometry to calculate the distance from the n-th neighbor point to the nearest point
+                    s1 = math.sin(theta) * D_t
+
+                    s2_left = D_n_left - math.cos(theta) * D_t
+                    D_t2n_left = math.sqrt(s1**2 + s2_left**2)
+
+                    # Check if the distance from then-th neighbor point to the nearest point is within the radius of the bubble
+                    if D_t2n_left < self.radius:
+                        # If it is, set the value of the neighbor point to 0 (eliminate it)
+                        ranges[min_index + n] = 0.0
+                    else:
+                        left_exceed = True
+
+            if not right_exceed:
+                if min_index - n < 0:
                     right_exceed = True
+                else:
+                    D_n_right = ranges[min_index - n]
+
+                    # Angle between the two beams (radians)
+                    theta = math.radians(math.radians(self.angle_increment) * n)
+                    # theta = math.radians(0.25 * n)
+
+                    # Draw a perpendicular line from the n-th nearest point to the neighbor beam
+                    # Use trigonometry to calculate the distance from the n-th neighbor point to the nearest point
+                    s1 = math.sin(theta) * D_t
+
+                    s2_right = D_n_right - math.cos(theta) * D_t
+                    D_t2n_right = math.sqrt(s1**2 + s2_right**2)
+
+                    if D_t2n_right < self.radius:
+                        # If it is, set the value of the neighbor point to 0 (eliminate it)
+                        ranges[min_index - n] = 0.0
+                    else:
+                        right_exceed = True
 
             n += 1
 
@@ -194,183 +197,87 @@ class ReactiveFollowGap(Node):
     def find_best_point(self, start_i, end_i, ranges):
         """Start_i & end_i are start and end indicies of max-gap range, respectively
         Return index of best point in ranges
-            Naive: Choose the furthest point within ranges and go there
         """
-        # Find the furthest point in the gap
+        # Return the lidar scan angle pointing toward the middle of the max-gap
+        best_idx = start_i + ((end_i - start_i) // 2)
 
-        # Extract the gap segment from the ranges and find the index of the maximum value in that segment
-        max_range_idx = np.argmax(ranges[start_i : end_i + 1])
+        if ranges[best_idx] < self.look_ahead_dist:
+            # Find the furthest point in the gap
 
-        # Add the starting offset to get the best point index in the sliced ranges array
-        best_idx = start_i + max_range_idx
+            # Extract the gap segment from the ranges and find the index of the maximum value in that segment
+            max_range_idx = np.argmax(ranges)
 
-        # Return the middle point of the gap as the best idx
-        # best_idx = start_i + ((end_i - start_i) // 2)
+            # Add the starting offset to get the best point index in the sliced ranges array
+            best_idx = start_i + max_range_idx
 
         return best_idx
-
-    def get_range(self, range_data, angle):
-        """
-        Helper function to return the corresponding range measurement at a given angle.
-        Make sure you take care of NaNs and infs.
-
-        Args:
-            range_data: single range array from the LiDAR
-            angle: between angle_min and angle_max of the LiDAR
-
-        Returns:
-            range: distance measurement in meters at the given angle
-        """
-
-        # Convert angle to index
-        idx = int((angle - self.angle_min) / self.angle_increment)
-
-        # Ensure index is within bounds 0 ≤ idx ≤ 1079
-        idx = max(0, min(idx, len(range_data) - 1))
-
-        # Use the index to obtain the distance data from the range data array
-        range_val = range_data[idx]
-
-        # Return a default value if the value returned is invalid
-        if (
-            range_val < self.range_min
-            or range_val > self.range_max
-            or math.isinf(range_val)
-            or math.isnan(range_val)
-        ):
-            return self.range_max
-
-        return range_val
 
     def scan_callback(self, msg):
         """Process the LaserScan message"""
         ranges = msg.ranges
         self.angle_min = msg.angle_min
-        self.angle_max = msg.angle_max
         self.angle_increment = msg.angle_increment
-        self.range_min = msg.range_min
-        self.range_max = msg.range_max
         proc_ranges = self.preprocess_lidar(ranges)
 
-        # Print the lidar data
-        # self.get_logger().info("----- RAW LIDAR DATA START -----")
-        # for i, d in enumerate(ranges):
-        #     angle_rad = msg.angle_min + i * msg.angle_increment
-        #     angle_deg = np.degrees(angle_rad)
-        #     self.get_logger().info(
-        #         f"RAW[{i}] angle={angle_deg:.2f}°, distance={d:.3f} m"
-        #     )
-
-        # self.get_logger().info("----- PREPROCESSED LIDAR DATA START -----")
-        # for i, d in enumerate(proc_ranges):
-        #     original_index = i + 280  # shift index
-        #     angle_rad = msg.angle_min + original_index * msg.angle_increment
-        #     angle_deg = np.degrees(angle_rad)
-
-        #     self.get_logger().info(
-        #         f"PROC[{i}] (RAW[{original_index}]) "
-        #         f"angle={angle_deg:.2f}°, distance={d:.3f} m"
-        #     )
-
-        # TODO:
         # Find closest point to LiDAR
-        min_distance = np.min(proc_ranges)
         min_index = np.argmin(proc_ranges)
 
-        # Print the closet obstacle
-        # self.get_logger().info(
-        #     f"[MIN] closest obstacle: dist={min_distance:.3f}m at index={min_index}",
-        #     throttle_duration_sec=1.0,
-        # )
-
-        # # Emergency brake if too close
-        # if min_distance < self.safety_distance:
-        #     # Emergency stop or turn if too close
-        #     drive_msg = AckermannDriveStamped()
-        #     drive_msg.drive.speed = 0.0
-        #     self.drive_publisher.publish(drive_msg)
-        #     return
-
-        # # Eliminate all points inside 'bubble' (set them to zero)
+        # Eliminate all points inside 'bubble' (set them to zero)
         free_space_ranges = proc_ranges.copy()
         free_space_ranges = self.draw_bubble(proc_ranges, min_index)
-
-        # Print the lidar data after a bubble is placed
-        # throttle the entire block into a single message per second
-        # lines = ["----- Bubbled LIDAR DATA START -----"]
-        # for i, d in enumerate(free_space_ranges):
-        #     original_index = i + 280  # shift index
-        #     angle_rad = msg.angle_min + original_index * msg.angle_increment
-        #     angle_deg = np.degrees(angle_rad)
-        #     lines.append(
-        #         f"Bubble PROC[{i}] (RAW[{original_index}]) "
-        #         f"angle={angle_deg:.2f}°, distance={d:.3f} m"
-        #     )
-        # self.get_logger().info("\n".join(lines), throttle_duration_sec=1.0)
 
         # # Find max length gap
         start_i, end_i = self.find_max_gap(free_space_ranges)
 
-        # Print the start and end index of the gap
-        # self.get_logger().info(
-        #     f"[GAP] max_gap: start={start_i} end={end_i} size={end_i - start_i + 1}",
-        #     throttle_duration_sec=1.0,
-        # )
-
         # Find the best point in the gap
         # add offset to get index in original ranges array
-        best_idx = self.find_best_point(start_i, end_i, free_space_ranges) + 179
+        best_idx = self.find_best_point(
+            start_i, end_i, free_space_ranges
+        ) + self.angle_to_index(self.crop_angle_right)
+
+        # Conpute the raw steering angle
         raw_angle = best_idx * msg.angle_increment + msg.angle_min
 
-        # Publish Drive message
-        drive_msg = AckermannDriveStamped()
-
-        # Print the index of the best point, and the angle the car should turn to
-        # ang_deg = math.degrees(best_angle)
-        # self.get_logger().info(
-        #     f"[BEST] index={best_idx} angle={ang_deg:.2f}° (rad={best_angle:.3f})",
-        #     throttle_duration_sec=1.0,
-        # )
-
-        # Low-pass filter to prevent oscillation
+        # Smooth steering angle prevent oscillation
         best_angle = (
             self.steering_smoothing * self.prev_steering
             + (1 - self.steering_smoothing) * raw_angle
         )
 
         self.prev_steering = best_angle
+
         # Adjust speed based on steering angle
         steering_deg = abs(best_angle)
 
         velocity = 1.5
-
-        # reactive_factor is for scaling up/down the steering angle based on steering angle
         reactive_factor = 1.0
 
         if steering_deg >= 1.5:
             velocity = 0.5
-            # reactive_factor = 1
+            reactive_factor = 1.8
         elif steering_deg >= 0.8:
             velocity = 1.0
-            # reactive_factor = 1.5
-        # else:
-        #     velocity = 1.5
-        #     reactive_factor = 1.0
+            reactive_factor = 1.3
         elif steering_deg >= 0.3:
             velocity = 1.5
-            # reactive_factor = 2
+            reactive_factor = 1
         else:
             velocity = 1.5
-            # reactive_factor = 0
+            reactive_factor = 1
 
+        # Publish Drive message
+        drive_msg = AckermannDriveStamped()
+
+        # Uncomment to scale steering_angle if needed
         # drive_msg.drive.steering_angle = best_angle * reactive_factor
         drive_msg.drive.steering_angle = best_angle
-        drive_msg.drive.speed = velocity * 1 / 3
 
-        # Log the steering angle and speed for debugging every 1 second
+        drive_msg.drive.speed = velocity * self.speed_factor
+
+        # Log the steering angle and speed for debugging
         self.get_logger().info(
             f"[DRIVE] steering={best_angle:.2f}° speed={velocity:.2f}m/s reactive fac = {reactive_factor}",
-            throttle_duration_sec=0.2,
+            # throttle_duration_sec=0.02,
         )
 
         self.drive_publisher.publish(drive_msg)
